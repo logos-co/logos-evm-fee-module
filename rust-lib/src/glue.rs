@@ -192,3 +192,13 @@ impl FeeModule for FeeModuleImpl {
         .to_string()
     }
 }
+
+// The registration hook. The generated provider glue DECLARES this symbol and
+// the loader resolves it at dlopen; the author owes the definition. Omitting it
+// links cleanly and produces a plugin that fails only on Linux, at load time,
+// with `undefined symbol: logos_module_install` -- macOS resolves lazily and
+// gives no hint. That is exactly how this module shipped its first build.
+#[no_mangle]
+pub extern "Rust" fn logos_module_install() {
+    install::<FeeModuleImpl>();
+}
