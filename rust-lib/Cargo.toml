@@ -1,0 +1,28 @@
+[package]
+name = "fee_module"
+version = "1.0.0"
+edition = "2021"
+description = "Logos fee_module — EIP-1559 fee suggestion for EVM chains, derived from eth_feeHistory."
+rust-version = "1.89"
+
+[workspace]
+resolver = "3"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# NO alloy. Fee arithmetic tops out around maxFeePerGas * gasLimit ~ 1e19 wei,
+# which fits u128 with ~19 orders of magnitude to spare; only balances and
+# transfer values need 256 bits and this module never touches one. Pulling a
+# whole EVM primitives crate for U256 also coupled us to whatever transitive
+# alloy versions happened to be cached (crates.io 403s at nix, so an uncached
+# version is a hard build failure). serde/serde_json are the whole dep set.
+
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[features]
+default = ["logos_module"]
+logos_module = ["dep:logos-rust-sdk"]
