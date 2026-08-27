@@ -108,7 +108,11 @@ impl FeeModuleImpl {
     /// usable fee history.
     fn tiers(&self, chain_id: i64) -> Result<(Vec<FeeSuggestion>, u128, &'static str), String> {
         let h = self.history(chain_id).unwrap_or_default();
-        let usable = !h.reward.is_empty() && estimator::next_base_fee(&h) != 0;
+        // A successful-but-EMPTY body is a miss, not a suggestion: the verified
+        // proxy answers eth_feeHistory with success:true and every array empty
+        // when blockCount is a hex string. No error to catch -- so the check
+        // lives in the estimator, where it is unit-tested, rather than here.
+        let usable = estimator::is_usable(&h);
         if usable {
             let base = estimator::next_base_fee(&h);
             Ok((TIERS.iter().enumerate().map(|(i, t)| estimator::suggest(&h, t, i)).collect(), base, "feeHistory"))

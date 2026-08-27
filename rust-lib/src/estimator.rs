@@ -79,6 +79,24 @@ pub fn next_base_fee(h: &FeeHistory) -> u128 {
     h.base_fee_per_gas.last().copied().unwrap_or(0u128)
 }
 
+/// Is this fee history actually usable, or is it a successful-but-empty body?
+///
+/// A node can answer `eth_feeHistory` with `success: true` and every array
+/// empty — observed through the nimbus verified proxy when `blockCount` is
+/// encoded as a hex string rather than a number. There is no error to catch, so
+/// a caller that only checks for failure derives tiers from nothing and still
+/// reports them as fee-history-derived.
+///
+/// Two ways to be empty, and BOTH matter:
+///   * no base fee at all, or `oldestBlock == 0` — the whole body is blank;
+///   * reward rows present but every row empty — this one is worse, because it
+///     survives a naive `!reward.is_empty()` check and yields a ZERO tip
+///     against a real base fee, i.e. a plausible suggestion that will not get
+///     the transaction mined.
+pub fn is_usable(h: &FeeHistory) -> bool {
+    next_base_fee(h) != 0 && h.reward.iter().any(|row| row.iter().any(|t| *t != 0))
+}
+
 /// Suggest a fee for one tier from fee history.
 ///
 /// `column` selects which percentile column of `reward` this tier used, since
@@ -218,6 +236,34 @@ mod tests {
         let s = suggest_legacy(gwei(30.0), &TIERS[1]);
         assert_eq!(s.max_priority_fee_per_gas, 0u128);
         assert!(s.max_fee_per_gas >= gwei(30.0));
+    }
+
+    #[test]
+    fn a_successful_but_empty_body_is_not_usable() {
+        // Verbatim shape returned by the verified proxy for a hex blockCount:
+        // success: true, every array empty, oldestBlock "0x0".
+        let h = FeeHistory { base_fee_per_gas: vec![], reward: vec![], gas_used_ratio: vec![] };
+        assert!(!is_usable(&h), "an empty body must be a MISS, not a suggestion");
+    }
+
+    #[test]
+    fn reward_rows_that_are_all_empty_are_not_usable() {
+        // The nastier shape: rows exist, so `!reward.is_empty()` passes, but
+        // there is no tip in any of them. Deriving from this gives a ZERO tip
+        // against a real base fee -- a suggestion that looks fine and does not
+        // get mined.
+        let h = FeeHistory {
+            base_fee_per_gas: vec![gwei(30.0), gwei(30.0)],
+            reward: vec![vec![], vec![], vec![]],
+            gas_used_ratio: vec![0.5; 3],
+        };
+        assert!(!is_usable(&h), "empty reward rows must be a MISS");
+    }
+
+    #[test]
+    fn a_real_body_is_usable() {
+        let h = history(gwei(30.0), &[[gwei(1.0); 3]; 3]);
+        assert!(is_usable(&h));
     }
 
     #[test]
