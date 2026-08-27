@@ -53,7 +53,8 @@ estimate(chain_id, request_json) -> { ok, maxFeePerGas, maxPriorityFeePerGas, ga
 ```
 
 `source` is `"feeHistory"`, `"gasPrice"` (legacy fallback) or `"custom"`.
-All wei values are decimal strings — JSON numbers cannot carry 256 bits.
+All **wei** values are decimal strings — JSON numbers cannot carry 256 bits.
+`gasLimit` is a JSON **number**: it is a bounded count, not a wei value.
 
 `estimate` accepts, in order of precedence:
 

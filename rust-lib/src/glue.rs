@@ -185,7 +185,12 @@ impl FeeModule for FeeModuleImpl {
             "ok": true,
             "maxFeePerGas": fee.max_fee_per_gas.to_string(),
             "maxPriorityFeePerGas": fee.max_priority_fee_per_gas.to_string(),
-            "gasLimit": gas_limit.to_string(),
+            // A NUMBER, not a string. Wei values are strings because 256 bits
+            // do not fit a JSON number -- a gas limit is a bounded count (block
+            // limits are ~30M), it fits comfortably, and every existing consumer
+            // already reads it as a number. Emitting it as a string silently
+            // broke `"gasLimit":21000` assertions downstream.
+            "gasLimit": u64::try_from(gas_limit).unwrap_or(u64::MAX),
             "totalWei": fee.max_fee_per_gas.saturating_mul(gas_limit).to_string(),
             "source": source,
         })
