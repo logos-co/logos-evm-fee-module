@@ -1,0 +1,68 @@
+name: fee_module Unit Tests
+
+# The fee-estimation algorithm, run on every change.
+#
+# These tests are the only thing standing between this module and a silent
+# repeat of the bug it exists to fix: wallet_backend used to derive
+# `max_priority_fee_per_gas = gas_price`, which tips approximately the whole base
+# fee and costs exactly 2x on every send. It was invisible to three green
+# doctests because Anvil and mock nodes do not care what you overpay.
+#
+# The doctests cannot cover this. They drive the module end-to-end through a
+# daemon and pass whether fees came from eth_feeHistory or the legacy gasPrice
+# fallback — so the estimator can be quietly wrong while everything is green.
+#
+# `--no-default-features` drops the `logos_module` glue and with it the
+# logos-rust-sdk path dependency, so this needs no SDK checkout, no nix and no
+# network beyond crates.io — which is why it can be plain cargo while the module
+# build goes through nix. (nix's own fetcher gets 403s from crates.io; plain
+# cargo does not.)
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (pure estimator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # Matches rust-version in rust-lib/Cargo.toml, itself pinned to the nix
+        # toolchain — so a test passing here cannot fail the real build on MSRV.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-lib
+
+      - name: cargo test --no-default-features
+        run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
+
+      - name: The regression tests must actually be present
+        # A suite that silently stops being compiled reads as coverage. Assert the
+        # tests exist by NAME rather than trusting a green run -- in particular the
+        # one pinning the 2x overpayment, which is the whole reason this module
+        # exists and the thing a future "simplification" would quietly drop.
+        run: |
+          out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
+          echo "$out"
+          for t in tip_comes_from_the_reward_column_not_from_gas_price \
+                   headroom_multiplies_base_not_gas_price \
+                   effective_price_caps_the_tip_at_the_remaining_room \
+                   a_successful_but_empty_body_is_not_usable \
+                   reward_rows_that_are_all_empty_are_not_usable; do
+            echo "$out" | grep -q "$t" || { echo "MISSING regression test: $t"; exit 1; }
+          done
+          n=$(echo "$out" | grep -c ': test$')
+          echo "estimator tests: $n"; [ "$n" -ge 11 ]
