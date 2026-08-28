@@ -42,6 +42,19 @@ jobs:
         with:
           toolchain: "1.89"
 
+      - name: Provide the SDK manifest cargo insists on resolving
+        # `--no-default-features` drops the logos_module feature, so the SDK is
+        # never COMPILED here -- but cargo still resolves the manifest of an
+        # optional path dependency, and `logos-rust-sdk-src` is gitignored
+        # because the nix builder stages it at build time. Without this the job
+        # dies before running a single test:
+        #   failed to load manifest for dependency `logos-rust-sdk`
+        # Any recent rev serves; nothing from it is built.
+        uses: actions/checkout@v4
+        with:
+          repository: logos-co/logos-rust-sdk
+          path: logos-rust-sdk-src
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-lib
