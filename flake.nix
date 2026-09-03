@@ -3,7 +3,12 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    eth_rpc_module.url = "github:logos-co/logos-evm-eth-rpc-module";
+    # Without the follows it drags its own module-builder, and a skewed generated ABI
+    # segfaults the module inside provider init.
+    eth_rpc_module = {
+      url = "github:logos-co/logos-evm-eth-rpc-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
