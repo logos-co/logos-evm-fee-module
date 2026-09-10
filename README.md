@@ -77,6 +77,12 @@ given.
   refactor, not a flag — see `wallet_backend_module`.
 - **No network of its own.** All RPC goes through `eth_rpc_module`, which owns
   the single fail-closed proxy chokepoint.
+- **The `tx` sent to `eth_estimateGas` carries a zero fee cap.** Given a `tx`
+  with no `gas`, the nimbus verified proxy prices the whole block gas limit
+  against the sender's balance and refuses anything under ~0.27 ETH. A zero cap
+  makes that check vacuous. Any fee field on the submitted `tx` is zeroed or
+  dropped for the estimate only — the returned fee comes from the request's
+  top-level `maxFeePerGas`/`maxPriorityFeePerGas` or the tier, untouched.
 - **No alloy.** Fee arithmetic tops out near `maxFee * gasLimit` ~ 1e19 wei,
   which fits `u128`; only balances need 256 bits and this module never touches
   one. The dep set is `serde` + `serde_json`.

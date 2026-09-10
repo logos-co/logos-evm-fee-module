@@ -16,5 +16,8 @@ mod estimator;
 pub use estimator::{effective_price, is_usable, median_tip, next_base_fee, suggest, suggest_legacy,
                     FeeHistory, FeeSuggestion, Tier, TIERS};
 
+mod tx;
+pub use tx::for_estimate;
+
 #[cfg(feature = "logos_module")]
 mod glue;

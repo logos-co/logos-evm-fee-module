@@ -16,6 +16,7 @@
 use serde_json::{json, Value};
 
 use crate::estimator::{self, FeeHistory, FeeSuggestion, TIERS};
+use crate::tx::for_estimate;
 
 /// Blocks of history to sample. Long enough that a single empty block does not
 /// swing the median, short enough to still track a moving base fee.
@@ -170,7 +171,7 @@ impl FeeModule for FeeModuleImpl {
         let gas_limit = if let Some(g) = req.get("gasLimit").and_then(any_u128) {
             g
         } else if let Some(tx) = req.get("tx") {
-            match modules().eth_rpc_module.estimate_gas(chain_id, &tx.to_string()) {
+            match modules().eth_rpc_module.estimate_gas(chain_id, &for_estimate(tx).to_string()) {
                 Ok(reply) => match inner(&reply) {
                     Ok(v) => hex_u128(&v),
                     Err(e) => return err(e),
