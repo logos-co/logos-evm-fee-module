@@ -3,20 +3,26 @@
 //! The builder derives the `.lidl` from the `FeeModule` trait below
 //! (`codegen.rust = { trait, source: "src/glue.rs" }`). Compiled only with the
 //! default `logos_module` feature; `cargo test --no-default-features` exercises
-//! the pure [`crate::estimator`] without the Logos runtime.
+//! the pure modules without the Logos runtime.
 //!
-//! `concurrency: "multi"` (metadata.json): every method here makes a blocking
-//! call out to `eth_rpc_module`, so the module opts into concurrent dispatch —
+//! `concurrency: "multi"` (metadata.json): every method here makes blocking
+//! calls out to `eth_rpc_module`, so the module opts into concurrent dispatch —
 //! one slow chain cannot stall a suggestion for another. The multi contract
 //! makes the generated trait take `&self` + `Send + Sync`, which is why this
 //! module holds NO mutable state at all: it is a pure function of what
-//! `eth_rpc_module` reports. Written that way from the first commit, because
-//! retrofitting `multi` onto a `&mut self` module is a refactor, not a flag.
+//! `eth_rpc_module` reports.
 
-use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::time::Duration;
 
+use serde_json::{json, Map, Value};
+
+use crate::budget::Budget;
+use crate::bundle::{self, Call};
 use crate::estimator::{self, FeeHistory, FeeSuggestion, TIERS};
+use crate::slots::{self, Approval};
 use crate::tx::for_estimate;
+use crate::units;
 
 /// Blocks of history to sample. Long enough that a single empty block does not
 /// swing the median, short enough to still track a moving base fee.
@@ -27,22 +33,46 @@ pub trait FeeModule: Send + Sync + 'static {
     ///
     /// `{ ok, chainId, baseFeePerGas, source, tiers: { slow, normal, fast } }`
     /// where each tier is `{ maxFeePerGas, maxPriorityFeePerGas }` as decimal
-    /// wei strings. `source` is `"feeHistory"` or `"gasPrice"` so a caller can
-    /// tell a real EIP-1559 suggestion from the legacy fallback.
+    /// wei strings. `source` is `"feeHistory"`, `"maxPriorityFee"` (a 1559 chain
+    /// whose reward rows were blank, priced off the node's own tip) or
+    /// `"gasPrice"` (the legacy fallback).
     fn suggest_fees(&self, chain_id: i64) -> String;
 
-    /// Resolve a concrete fee for a send, honouring any override.
+    /// Resolve a concrete fee for ONE call, honouring any override.
     ///
     /// `request_json` accepts:
     ///   `{ "tier": "slow"|"normal"|"fast" }`            — pick a suggested tier
     ///   `{ "maxFeePerGas": "...", "maxPriorityFeePerGas": "..." }` — override
     ///   `{ "gasLimit": "..." }`                          — override the limit
     ///   `{ "tx": { ... } }`                              — estimate the limit
+    ///   `{ "deadlineMs": 5000 }`                         — bound this call
     ///
-    /// Returns `{ ok, maxFeePerGas, maxPriorityFeePerGas, gasLimit, totalWei,
-    /// source }`. An explicit fee override is used verbatim — this module
-    /// advises, it does not overrule the user.
+    /// Returns `{ ok, chainId, maxFeePerGas, maxPriorityFeePerGas, gasLimit,
+    /// gasSource, feeCeilingWei(+Display/Exact), totalWei, baseFeePerGas,
+    /// source }`. `totalWei` equals `feeCeilingWei` and stays for older callers.
+    /// An explicit fee override is used verbatim — this module advises, it does
+    /// not overrule the user.
     fn estimate(&self, chain_id: i64, request_json: String) -> String;
+
+    /// Price a bundle of calls that will leave in order, from one account.
+    ///
+    /// `request_json`: `{ from, calls: [{ to, value?, data?, gasLimit?, label? }],
+    /// tier? | maxFeePerGas? + maxPriorityFeePerGas?, deadlineMs? }`.
+    ///
+    /// Each call is estimated as the chain will find it: an ERC-20 `approve` in an
+    /// earlier call becomes a state override on that token's allowance slot for
+    /// every later call, so a swap behind its approval gets a real estimate and a
+    /// USDT-style reset-then-set is estimated with the reset applied. A call with
+    /// its own `gasLimit` is taken as given. The first call that cannot be
+    /// estimated refuses the bundle, naming it.
+    ///
+    /// Returns `{ ok, chainId, source, baseFeePerGas, maxFeePerGas,
+    /// maxPriorityFeePerGas, gasLimit, feeCeilingWei(+Display/Exact),
+    /// calls: [{ gasLimit, gasSource: "given"|"estimated"|"simulated",
+    /// feeCeilingWei(+Display/Exact) }], assumptions: [{ call, after, token,
+    /// spender, allowance }], nativeDecimals }`. One fee for the bundle; every
+    /// ceiling is `maxFeePerGas × gasLimit`, in wei and in the native unit.
+    fn estimate_bundle(&self, chain_id: i64, request_json: String) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -74,20 +104,41 @@ fn hex_u128(v: &Value) -> u128 {
 
 /// Decimal-or-hex wei string to u128 — callers may pass either.
 fn any_u128(v: &Value) -> Option<u128> {
-    let s = v.as_str()?;
-    match s.strip_prefix("0x") {
-        Some(h) => u128::from_str_radix(h, 16).ok(),
-        None => s.parse::<u128>().ok(),
-    }
+    v.as_str().and_then(bundle::parse_quantity)
 }
 
+fn is_address(s: &str) -> bool {
+    let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or("");
+    h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The fee a request resolves to, and where it came from.
+struct Priced {
+    fee: FeeSuggestion,
+    source: &'static str,
+    base: u128,
+}
+
+/// One call's gas limit and how it was obtained.
+struct Gas {
+    limit: u64,
+    source: &'static str,
+}
+
+type SlotCache = HashMap<(String, String), Option<String>>;
+
 impl FeeModuleImpl {
+    fn grant(b: &Budget, what: &str) -> Result<Duration, String> {
+        b.take().ok_or_else(|| format!("no time left to {what}"))
+    }
+
     /// Pull fee history for every tier percentile in ONE call.
-    fn history(&self, chain_id: i64) -> Result<FeeHistory, String> {
+    fn history(&self, chain_id: i64, b: &Budget) -> Result<FeeHistory, String> {
+        let t = Self::grant(b, "read the fee history")?;
         let percentiles: Vec<f64> = TIERS.iter().map(|t| t.reward_percentile).collect();
         let reply = modules()
             .eth_rpc_module
-            .fee_history(chain_id, HISTORY_BLOCKS, &json!(percentiles).to_string())
+            .fee_history_with_timeout(chain_id, HISTORY_BLOCKS, &json!(percentiles).to_string(), t)
             .map_err(|e| format!("{e:?}"))?;
         let r = inner(&reply)?;
         Ok(FeeHistory {
@@ -100,33 +151,171 @@ impl FeeModuleImpl {
         })
     }
 
-    fn gas_price(&self, chain_id: i64) -> Result<u128, String> {
-        let reply = modules().eth_rpc_module.gas_price(chain_id).map_err(|e| format!("{e:?}"))?;
+    fn gas_price(&self, chain_id: i64, b: &Budget) -> Result<u128, String> {
+        let t = Self::grant(b, "read the gas price")?;
+        let reply = modules().eth_rpc_module.gas_price_with_timeout(chain_id, t).map_err(|e| format!("{e:?}"))?;
         Ok(hex_u128(&inner(&reply)?))
     }
 
-    /// Suggestions per tier, with the legacy fallback when a chain has no
-    /// usable fee history.
-    fn tiers(&self, chain_id: i64) -> Result<(Vec<FeeSuggestion>, u128, &'static str), String> {
-        let h = self.history(chain_id).unwrap_or_default();
-        // A successful-but-EMPTY body is a miss, not a suggestion: the verified
-        // proxy answers eth_feeHistory with success:true and every array empty
-        // when blockCount is a hex string. No error to catch -- so the check
+    /// The node's own tip suggestion, or nothing where the method is not served.
+    fn node_tip(&self, chain_id: i64, b: &Budget) -> Option<u128> {
+        let t = b.take()?;
+        let reply = modules()
+            .eth_rpc_module
+            .raw_rpc_with_timeout(chain_id, "eth_maxPriorityFeePerGas", "[]", t)
+            .ok()?;
+        inner(&reply).ok().map(|v| hex_u128(&v))
+    }
+
+    /// Suggestions per tier: from the reward rows, else from the node's own tip against
+    /// the base fee the history still carries, else the legacy gas price.
+    fn tiers(&self, chain_id: i64, b: &Budget) -> Result<(Vec<FeeSuggestion>, u128, &'static str), String> {
+        let h = self.history(chain_id, b).unwrap_or_default();
+        // A successful-but-EMPTY body is a miss, not a suggestion: the verified proxy
+        // answered eth_feeHistory with every array empty for a hex blockCount. The check
         // lives in the estimator, where it is unit-tested, rather than here.
-        let usable = estimator::is_usable(&h);
-        if usable {
+        if estimator::is_usable(&h) {
             let base = estimator::next_base_fee(&h);
-            Ok((TIERS.iter().enumerate().map(|(i, t)| estimator::suggest(&h, t, i)).collect(), base, "feeHistory"))
-        } else {
-            let gp = self.gas_price(chain_id)?;
-            Ok((TIERS.iter().map(|t| estimator::suggest_legacy(gp, t)).collect(), 0u128, "gasPrice"))
+            let mut v: Vec<FeeSuggestion> = TIERS.iter().enumerate().map(|(i, t)| estimator::suggest(&h, t, i)).collect();
+            estimator::monotone(&mut v);
+            return Ok((v, base, "feeHistory"));
         }
+        let base = estimator::next_base_fee(&h);
+        if base != 0 {
+            if let Some(tip) = self.node_tip(chain_id, b) {
+                let v = TIERS.iter().map(|t| estimator::suggest_with_tip(base, tip, t)).collect();
+                return Ok((v, base, "maxPriorityFee"));
+            }
+        }
+        let gp = self.gas_price(chain_id, b)?;
+        Ok((TIERS.iter().map(|t| estimator::suggest_legacy(gp, t)).collect(), 0u128, "gasPrice"))
+    }
+
+    /// A caller that supplies BOTH fee fields is obeyed verbatim; we advise, we do not
+    /// overrule. Anything missing falls back to the named tier.
+    fn fee_for(&self, chain_id: i64, req: &Value, b: &Budget) -> Result<Priced, String> {
+        let over_max = req.get("maxFeePerGas").and_then(any_u128);
+        let over_tip = req.get("maxPriorityFeePerGas").and_then(any_u128);
+        if let (Some(m), Some(p)) = (over_max, over_tip) {
+            if p > m {
+                return Err("maxPriorityFeePerGas cannot exceed maxFeePerGas".into());
+            }
+            return Ok(Priced { fee: FeeSuggestion { max_fee_per_gas: m, max_priority_fee_per_gas: p }, source: "custom", base: 0 });
+        }
+        let wanted = req.get("tier").and_then(Value::as_str).unwrap_or("normal");
+        let idx = TIERS.iter().position(|t| t.name == wanted).unwrap_or(1);
+        let (sugg, base, source) = self.tiers(chain_id, b)?;
+        Ok(Priced { fee: sugg[idx].clone(), source, base })
+    }
+
+    /// The slot a token keeps `allowance[owner][spender]` in, asked once per pair.
+    fn allowance_slot(&self, chain_id: i64, a: &Approval, owner: &str, cache: &mut SlotCache, b: &Budget) -> Option<String> {
+        let key = (a.token.clone(), a.spender.clone());
+        if let Some(hit) = cache.get(&key) {
+            return hit.clone();
+        }
+        let found = (|| {
+            let p = slots::probe(&a.token, owner, &a.spender)?;
+            let t = b.take()?;
+            let params = json!([p.call, "latest", p.overrides]).to_string();
+            let reply = modules().eth_rpc_module.raw_rpc_with_timeout(chain_id, "eth_call", &params, t).ok()?;
+            let answer = inner(&reply).ok()?;
+            slots::identify(&p, answer.as_str()?)
+        })();
+        cache.insert(key, found.clone());
+        found
+    }
+
+    /// `eth_estimateGas` for call `i`, under the allowances the calls before it set.
+    fn estimate_call(
+        &self,
+        chain_id: i64,
+        from: &str,
+        calls: &[Call],
+        i: usize,
+        cache: &mut SlotCache,
+        assumptions: &mut Vec<Value>,
+        b: &Budget,
+    ) -> Result<Gas, String> {
+        let call = &calls[i];
+        if let Some(g) = call.gas_limit {
+            return Ok(Gas { limit: g, source: "given" });
+        }
+        let name = bundle::call_name(i, call);
+        let mut diffs: Map<String, Value> = Map::new();
+        let mut unlocated: Vec<String> = Vec::new();
+        for (j, a) in bundle::approvals_before(calls, i) {
+            match self.allowance_slot(chain_id, &a, from, cache, b) {
+                Some(slot) => {
+                    let entry = diffs.entry(a.token.clone()).or_insert_with(|| json!({ "stateDiff": {} }));
+                    entry["stateDiff"][slot] = json!(a.amount_word);
+                    assumptions.push(json!({
+                        "call": i + 1, "after": j + 1,
+                        "token": a.token, "spender": a.spender, "allowance": a.amount(),
+                    }));
+                }
+                None => unlocated.push(format!("the allowance {} keeps for {} could not be located, so call {} was not modelled", a.token, a.spender, j + 1)),
+            }
+        }
+        let tx = for_estimate(&call.tx(from));
+        let t = Self::grant(b, &format!("estimate {name}"))?;
+        let reply = if diffs.is_empty() {
+            modules().eth_rpc_module.estimate_gas_with_timeout(chain_id, &tx.to_string(), t)
+        } else {
+            let params = json!([tx, "latest", Value::Object(diffs.clone())]).to_string();
+            modules().eth_rpc_module.raw_rpc_with_timeout(chain_id, "eth_estimateGas", &params, t)
+        }
+        .map_err(|e| format!("{name} could not be estimated: {e:?}"))?;
+        let gas = inner(&reply).map_err(|why| {
+            let mut msg = format!("{name} could not be estimated: {why}");
+            for u in &unlocated {
+                msg.push_str("; ");
+                msg.push_str(u);
+            }
+            msg.push_str("; give it a gasLimit if it depends on an earlier call's effect that is not an ERC-20 approve");
+            msg
+        })?;
+        Ok(Gas {
+            limit: u64::try_from(hex_u128(&gas)).unwrap_or(u64::MAX),
+            source: if diffs.is_empty() { "estimated" } else { "simulated" },
+        })
+    }
+
+    fn bundle_reply(chain_id: i64, priced: &Priced, gas: &[Gas], assumptions: Vec<Value>) -> Value {
+        let mut calls = Vec::with_capacity(gas.len());
+        let mut total_gas: u64 = 0;
+        let mut total_ceiling: u128 = 0;
+        for g in gas {
+            let ceiling = priced.fee.max_fee_per_gas.saturating_mul(u128::from(g.limit));
+            let mut c = json!({ "gasLimit": g.limit, "gasSource": g.source });
+            units::decorate(&mut c, "feeCeilingWei", ceiling);
+            calls.push(c);
+            total_gas = total_gas.saturating_add(g.limit);
+            total_ceiling = total_ceiling.saturating_add(ceiling);
+        }
+        let mut v = json!({
+            "ok": true,
+            "chainId": chain_id,
+            "source": priced.source,
+            "baseFeePerGas": priced.base.to_string(),
+            "maxFeePerGas": priced.fee.max_fee_per_gas.to_string(),
+            "maxPriorityFeePerGas": priced.fee.max_priority_fee_per_gas.to_string(),
+            // A NUMBER, not a string: a gas limit is a bounded count, and every consumer
+            // reads it as one. Wei values are strings because 256 bits do not fit a number.
+            "gasLimit": total_gas,
+            "calls": calls,
+            "assumptions": assumptions,
+            "nativeDecimals": units::NATIVE_DECIMALS,
+        });
+        units::decorate(&mut v, "feeCeilingWei", total_ceiling);
+        v
     }
 }
 
 impl FeeModule for FeeModuleImpl {
     fn suggest_fees(&self, chain_id: i64) -> String {
-        let (sugg, base, source) = match self.tiers(chain_id) {
+        let b = Budget::bounded_by(None);
+        let (sugg, base, source) = match self.tiers(chain_id, &b) {
             Ok(v) => v,
             Err(e) => return err(e),
         };
@@ -146,56 +335,77 @@ impl FeeModule for FeeModuleImpl {
     }
 
     fn estimate(&self, chain_id: i64, request_json: String) -> String {
-        let req: Value = match serde_json::from_str(&request_json) {
-            Ok(v) => v,
-            Err(_) => json!({}),
+        let req: Value = serde_json::from_str(&request_json).unwrap_or_else(|_| json!({}));
+        let b = Budget::bounded_by(req.get("deadlineMs").and_then(Value::as_i64));
+        let priced = match self.fee_for(chain_id, &req, &b) {
+            Ok(p) => p,
+            Err(e) => return err(e),
         };
 
-        // A caller that supplies BOTH fee fields is obeyed verbatim; we advise,
-        // we do not overrule. Anything missing falls back to the named tier.
-        let over_max = req.get("maxFeePerGas").and_then(any_u128);
-        let over_tip = req.get("maxPriorityFeePerGas").and_then(any_u128);
-
-        let (fee, source) = if let (Some(m), Some(p)) = (over_max, over_tip) {
-            (FeeSuggestion { max_fee_per_gas: m, max_priority_fee_per_gas: p }, "custom")
-        } else {
-            let wanted = req.get("tier").and_then(Value::as_str).unwrap_or("normal");
-            let idx = TIERS.iter().position(|t| t.name == wanted).unwrap_or(1);
-            match self.tiers(chain_id) {
-                Ok((sugg, _, src)) => (sugg[idx].clone(), src),
-                Err(e) => return err(e),
-            }
-        };
-
-        // Gas limit: an explicit override, else estimate_gas on the supplied tx.
-        let gas_limit = if let Some(g) = req.get("gasLimit").and_then(any_u128) {
-            g
+        // Gas limit: an explicit override, else estimate_gas on the supplied tx. The tx is
+        // the caller's own; only its fee fields are rewritten for the estimate.
+        let gas = if let Some(g) = req.get("gasLimit").and_then(any_u128) {
+            Gas { limit: u64::try_from(g).unwrap_or(u64::MAX), source: "given" }
         } else if let Some(tx) = req.get("tx") {
-            match modules().eth_rpc_module.estimate_gas(chain_id, &for_estimate(tx).to_string()) {
+            let t = match Self::grant(&b, "estimate the call") {
+                Ok(t) => t,
+                Err(e) => return err(e),
+            };
+            match modules().eth_rpc_module.estimate_gas_with_timeout(chain_id, &for_estimate(tx).to_string(), t) {
                 Ok(reply) => match inner(&reply) {
-                    Ok(v) => hex_u128(&v),
+                    Ok(v) => Gas { limit: u64::try_from(hex_u128(&v)).unwrap_or(u64::MAX), source: "estimated" },
                     Err(e) => return err(e),
                 },
                 Err(e) => return err(format!("{e:?}")),
             }
         } else {
-            0u128
+            Gas { limit: 0, source: "none" }
         };
 
-        json!({
+        let ceiling = priced.fee.max_fee_per_gas.saturating_mul(u128::from(gas.limit));
+        let mut v = json!({
             "ok": true,
-            "maxFeePerGas": fee.max_fee_per_gas.to_string(),
-            "maxPriorityFeePerGas": fee.max_priority_fee_per_gas.to_string(),
-            // A NUMBER, not a string. Wei values are strings because 256 bits
-            // do not fit a JSON number -- a gas limit is a bounded count (block
-            // limits are ~30M), it fits comfortably, and every existing consumer
-            // already reads it as a number. Emitting it as a string silently
-            // broke `"gasLimit":21000` assertions downstream.
-            "gasLimit": u64::try_from(gas_limit).unwrap_or(u64::MAX),
-            "totalWei": fee.max_fee_per_gas.saturating_mul(gas_limit).to_string(),
-            "source": source,
-        })
-        .to_string()
+            "chainId": chain_id,
+            "maxFeePerGas": priced.fee.max_fee_per_gas.to_string(),
+            "maxPriorityFeePerGas": priced.fee.max_priority_fee_per_gas.to_string(),
+            "gasLimit": gas.limit,
+            "gasSource": gas.source,
+            "totalWei": ceiling.to_string(),
+            "baseFeePerGas": priced.base.to_string(),
+            "source": priced.source,
+        });
+        units::decorate(&mut v, "feeCeilingWei", ceiling);
+        v.to_string()
+    }
+
+    fn estimate_bundle(&self, chain_id: i64, request_json: String) -> String {
+        let req: Value = match serde_json::from_str(&request_json) {
+            Ok(v) => v,
+            Err(e) => return err(format!("request is not JSON: {e}")),
+        };
+        let b = Budget::bounded_by(req.get("deadlineMs").and_then(Value::as_i64));
+        let from = req.get("from").and_then(Value::as_str).map(str::trim).unwrap_or("");
+        if !is_address(from) {
+            return err("`from` is not an address");
+        }
+        let calls = match bundle::parse_calls(&req) {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        let priced = match self.fee_for(chain_id, &req, &b) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        let mut cache = SlotCache::new();
+        let mut assumptions = Vec::new();
+        let mut gas = Vec::with_capacity(calls.len());
+        for i in 0..calls.len() {
+            match self.estimate_call(chain_id, from, &calls, i, &mut cache, &mut assumptions, &b) {
+                Ok(g) => gas.push(g),
+                Err(e) => return json!({ "ok": false, "error": e, "call": i + 1 }).to_string(),
+            }
+        }
+        Self::bundle_reply(chain_id, &priced, &gas, assumptions).to_string()
     }
 }
 
