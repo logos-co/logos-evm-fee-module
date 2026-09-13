@@ -29,13 +29,14 @@ pub struct Tier {
     pub base_headroom: u64,
 }
 
-/// Slow / normal / fast. Percentiles are the conventional spread; headroom
-/// rises with urgency because a fast transaction is the one that must survive
-/// several blocks of base-fee growth.
+/// Slow / normal / fast. A block's reward percentiles are its included tips ordered by gas,
+/// so the marginal tip that got in sits low in the distribution; the top of it is MEV.
+/// Measured on mainnet 2026-09-13 at a 0.07 gwei base fee: p50 ≈ 0.009 gwei, p90 ≈ 1 gwei —
+/// the old fast tier tipped fourteen base fees for the same next-block inclusion.
 pub const TIERS: [Tier; 3] = [
     Tier { name: "slow",   reward_percentile: 10.0, base_headroom: 2 },
-    Tier { name: "normal", reward_percentile: 50.0, base_headroom: 2 },
-    Tier { name: "fast",   reward_percentile: 90.0, base_headroom: 3 },
+    Tier { name: "normal", reward_percentile: 30.0, base_headroom: 2 },
+    Tier { name: "fast",   reward_percentile: 60.0, base_headroom: 3 },
 ];
 
 // No serde derive: u128 has no serde impl without alloy's `serde` feature, and
@@ -97,6 +98,15 @@ pub fn is_usable(h: &FeeHistory) -> bool {
     next_base_fee(h) != 0 && h.reward.iter().any(|row| row.iter().any(|t| *t != 0))
 }
 
+/// A tier priced from a base fee and a tip that came from anywhere: the node's own
+/// `eth_maxPriorityFeePerGas` when the reward rows are blank, or the history below.
+pub fn suggest_with_tip(base: u128, tip: u128, tier: &Tier) -> FeeSuggestion {
+    FeeSuggestion {
+        max_fee_per_gas: base.saturating_mul(u128::from(tier.base_headroom)).saturating_add(tip),
+        max_priority_fee_per_gas: tip,
+    }
+}
+
 /// Suggest a fee for one tier from fee history.
 ///
 /// `column` selects which percentile column of `reward` this tier used, since
@@ -107,11 +117,18 @@ pub fn suggest(h: &FeeHistory, tier: &Tier, column: usize) -> FeeSuggestion {
         .iter()
         .filter_map(|row| row.get(column).copied())
         .collect();
-    let tip = median_tip(tips);
-    let base = next_base_fee(h);
-    FeeSuggestion {
-        max_fee_per_gas: base.saturating_mul(u128::from(tier.base_headroom)).saturating_add(tip),
-        max_priority_fee_per_gas: tip,
+    suggest_with_tip(next_base_fee(h), median_tip(tips), tier)
+}
+
+/// Make the tiers non-decreasing in tip and in cap. Each column drops its zero rewards
+/// before the median, so a thin low column can median ABOVE a fuller higher one; a "slow"
+/// that costs more than "normal" is a suggestion no human can act on.
+pub fn monotone(tiers: &mut [FeeSuggestion]) {
+    for i in 1..tiers.len() {
+        let prev = tiers[i - 1].clone();
+        let cur = &mut tiers[i];
+        cur.max_priority_fee_per_gas = cur.max_priority_fee_per_gas.max(prev.max_priority_fee_per_gas);
+        cur.max_fee_per_gas = cur.max_fee_per_gas.max(prev.max_fee_per_gas).max(cur.max_priority_fee_per_gas);
     }
 }
 
@@ -219,6 +236,39 @@ mod tests {
         assert!(fast.max_fee_per_gas > slow.max_fee_per_gas);
         // A fast tx should still be includable after the base fee doubles.
         assert!(fast.max_fee_per_gas > base * 2);
+    }
+
+    #[test]
+    fn tiers_never_invert_when_zero_rewards_thin_a_column() {
+        // Measured shape, 2026-09-13: the p10 column is zero in eight blocks of ten and
+        // 0.006 gwei in one, so its nonzero median is 0.006 while p30's is 0.001.
+        let mut rows = [[0u128, gwei(0.001), gwei(0.01)]; 10];
+        rows[4] = [gwei(0.006), gwei(0.006), gwei(0.02)];
+        let h = history(gwei(0.07), &rows);
+        let mut tiers: Vec<FeeSuggestion> =
+            TIERS.iter().enumerate().map(|(i, t)| suggest(&h, t, i)).collect();
+        assert!(tiers[0].max_priority_fee_per_gas > tiers[1].max_priority_fee_per_gas,
+                "the raw medians DO invert here; that is the defect");
+        monotone(&mut tiers);
+        for w in tiers.windows(2) {
+            assert!(w[0].max_priority_fee_per_gas <= w[1].max_priority_fee_per_gas);
+            assert!(w[0].max_fee_per_gas <= w[1].max_fee_per_gas);
+        }
+        for t in &tiers {
+            assert!(t.max_priority_fee_per_gas <= t.max_fee_per_gas, "a tip above its own cap");
+        }
+        assert_eq!(tiers[1].max_priority_fee_per_gas, gwei(0.006), "lifted to slow's, not invented");
+    }
+
+    #[test]
+    fn a_known_tip_prices_every_tier_off_the_base_fee() {
+        // The fallback for a 1559 chain whose reward rows are blank: the node's own tip.
+        let (base, tip) = (gwei(1.0), gwei(1.0));
+        let normal = suggest_with_tip(base, tip, &TIERS[1]);
+        let fast = suggest_with_tip(base, tip, &TIERS[2]);
+        assert_eq!(normal, FeeSuggestion { max_fee_per_gas: gwei(3.0), max_priority_fee_per_gas: tip });
+        assert_eq!(fast.max_fee_per_gas, gwei(4.0));
+        assert_eq!(suggest_with_tip(base, 0, &TIERS[0]).max_priority_fee_per_gas, 0, "a zero tip is passed on, not padded");
     }
 
     #[test]
