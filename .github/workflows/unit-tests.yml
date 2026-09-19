@@ -82,8 +82,9 @@ jobs:
                    the_slot_arithmetic_matches_cast_for_both_layouts \
                    a_probe_names_the_slot_a_token_reads \
                    an_approve_only_reaches_the_calls_after_it \
-                   a_reset_then_set_reads_as_the_set_and_the_set_sees_the_reset; do
+                   a_reset_then_set_reads_as_the_set_and_the_set_sees_the_reset \
+                   a_lone_tip_rides_on_the_tiers_headroom_over_the_base_fee; do
             echo "$out" | grep -q "$t" || { echo "MISSING regression test: $t"; exit 1; }
           done
           n=$(echo "$out" | grep -c ': test$')
-          echo "unit tests: $n"; [ "$n" -ge 33 ]
+          echo "unit tests: $n"; [ "$n" -ge 37 ]
