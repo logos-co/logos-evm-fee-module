@@ -15,8 +15,8 @@
 //! `logos_module` feature. This module makes no network calls of its own — it
 //! asks `eth_rpc_module`, which owns the single fail-closed HTTP chokepoint.
 mod estimator;
-pub use estimator::{effective_price, is_usable, median_tip, monotone, next_base_fee, suggest,
-                    suggest_legacy, suggest_with_tip, FeeHistory, FeeSuggestion, Tier, TIERS};
+pub use estimator::{effective_price, is_usable, median_tip, monotone, next_base_fee, pricing, suggest,
+                    suggest_legacy, suggest_with_tip, FeeHistory, FeeSuggestion, Pricing, Tier, TIERS};
 
 mod tx;
 pub use tx::for_estimate;

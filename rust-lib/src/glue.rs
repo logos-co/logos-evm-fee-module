@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 
 use crate::budget::Budget;
 use crate::bundle::{self, Call};
-use crate::estimator::{self, FeeHistory, FeeSuggestion, TIERS};
+use crate::estimator::{self, FeeHistory, FeeSuggestion, Pricing, TIERS};
 use crate::slots::{self, Approval};
 use crate::tx::for_estimate;
 use crate::units;
@@ -35,7 +35,8 @@ pub trait FeeModule: Send + Sync + 'static {
     /// where each tier is `{ maxFeePerGas, maxPriorityFeePerGas }` as decimal
     /// wei strings. `source` is `"feeHistory"`, `"maxPriorityFee"` (a 1559 chain
     /// whose reward rows were blank, priced off the node's own tip) or
-    /// `"gasPrice"` (the legacy fallback).
+    /// `"gasPrice"` (a chain with no base fee). A fee history that cannot be read
+    /// is `ok: false`.
     fn suggest_fees(&self, chain_id: i64) -> String;
 
     /// Resolve a concrete fee for ONE call, honouring any override.
@@ -157,38 +158,35 @@ impl FeeModuleImpl {
         Ok(hex_u128(&inner(&reply)?))
     }
 
-    /// The node's own tip suggestion, or nothing where the method is not served.
-    fn node_tip(&self, chain_id: i64, b: &Budget) -> Option<u128> {
-        let t = b.take()?;
+    /// The node's own tip suggestion.
+    fn node_tip(&self, chain_id: i64, b: &Budget) -> Result<u128, String> {
+        let t = Self::grant(b, "read the node's tip")?;
         let reply = modules()
             .eth_rpc_module
             .raw_rpc_with_timeout(chain_id, "eth_maxPriorityFeePerGas", "[]", t)
-            .ok()?;
-        inner(&reply).ok().map(|v| hex_u128(&v))
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(hex_u128(&inner(&reply)?))
     }
 
-    /// Suggestions per tier: from the reward rows, else from the node's own tip against
-    /// the base fee the history still carries, else the legacy gas price.
+    /// Suggestions per tier, priced as [`estimator::pricing`] decides. A history or a tip
+    /// that cannot be read is the answer's error, never a zero tip.
     fn tiers(&self, chain_id: i64, b: &Budget) -> Result<(Vec<FeeSuggestion>, u128, &'static str), String> {
-        let h = self.history(chain_id, b).unwrap_or_default();
-        // A successful-but-EMPTY body is a miss, not a suggestion: the verified proxy
-        // answered eth_feeHistory with every array empty for a hex blockCount. The check
-        // lives in the estimator, where it is unit-tested, rather than here.
-        if estimator::is_usable(&h) {
-            let base = estimator::next_base_fee(&h);
-            let mut v: Vec<FeeSuggestion> = TIERS.iter().enumerate().map(|(i, t)| estimator::suggest(&h, t, i)).collect();
-            estimator::monotone(&mut v);
-            return Ok((v, base, "feeHistory"));
-        }
-        let base = estimator::next_base_fee(&h);
-        if base != 0 {
-            if let Some(tip) = self.node_tip(chain_id, b) {
-                let v = TIERS.iter().map(|t| estimator::suggest_with_tip(base, tip, t)).collect();
-                return Ok((v, base, "maxPriorityFee"));
+        let read = self.history(chain_id, b);
+        match estimator::pricing(&read)? {
+            Pricing::Rewards(h) => {
+                let mut v: Vec<FeeSuggestion> = TIERS.iter().enumerate().map(|(i, t)| estimator::suggest(h, t, i)).collect();
+                estimator::monotone(&mut v);
+                Ok((v, estimator::next_base_fee(h), "feeHistory"))
+            }
+            Pricing::NodeTip(base) => {
+                let tip = self.node_tip(chain_id, b)?;
+                Ok((TIERS.iter().map(|t| estimator::suggest_with_tip(base, tip, t)).collect(), base, "maxPriorityFee"))
+            }
+            Pricing::GasPrice => {
+                let gp = self.gas_price(chain_id, b)?;
+                Ok((TIERS.iter().map(|t| estimator::suggest_legacy(gp, t)).collect(), 0u128, "gasPrice"))
             }
         }
-        let gp = self.gas_price(chain_id, b)?;
-        Ok((TIERS.iter().map(|t| estimator::suggest_legacy(gp, t)).collect(), 0u128, "gasPrice"))
     }
 
     /// A caller that supplies BOTH fee fields is obeyed verbatim; we advise, we do not

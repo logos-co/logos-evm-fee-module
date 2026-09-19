@@ -75,6 +75,7 @@ jobs:
                    effective_price_caps_the_tip_at_the_remaining_room \
                    a_successful_but_empty_body_is_not_usable \
                    reward_rows_that_are_all_empty_are_not_usable \
+                   a_fee_history_that_cannot_be_read_is_an_error \
                    a_plain_transfer_gains_a_zero_fee_cap \
                    a_caller_supplied_tip_is_zeroed_beside_the_zero_cap \
                    tiers_never_invert_when_zero_rewards_thin_a_column \
@@ -85,4 +86,4 @@ jobs:
             echo "$out" | grep -q "$t" || { echo "MISSING regression test: $t"; exit 1; }
           done
           n=$(echo "$out" | grep -c ': test$')
-          echo "unit tests: $n"; [ "$n" -ge 31 ]
+          echo "unit tests: $n"; [ "$n" -ge 33 ]

@@ -83,10 +83,10 @@ pub fn next_base_fee(h: &FeeHistory) -> u128 {
 /// Is this fee history actually usable, or is it a successful-but-empty body?
 ///
 /// A node can answer `eth_feeHistory` with `success: true` and every array
-/// empty — observed through the nimbus verified proxy when `blockCount` is
-/// encoded as a hex string rather than a number. There is no error to catch, so
-/// a caller that only checks for failure derives tiers from nothing and still
-/// reports them as fee-history-derived.
+/// empty — observed through the nimbus verified proxy before 71f2a085, for a
+/// hex `blockCount`. There is no error to catch, so a caller that only checks
+/// for failure derives tiers from nothing and still reports them as
+/// fee-history-derived.
 ///
 /// Two ways to be empty, and BOTH matter:
 ///   * no base fee at all, or `oldestBlock == 0` — the whole body is blank;
@@ -96,6 +96,30 @@ pub fn next_base_fee(h: &FeeHistory) -> u128 {
 ///     the transaction mined.
 pub fn is_usable(h: &FeeHistory) -> bool {
     next_base_fee(h) != 0 && h.reward.iter().any(|row| row.iter().any(|t| *t != 0))
+}
+
+/// Where a chain's tiers are priced from.
+#[derive(Debug)]
+pub enum Pricing<'a> {
+    /// The history's reward rows.
+    Rewards(&'a FeeHistory),
+    /// The node's own tip against this base fee: the reward rows were blank.
+    NodeTip(u128),
+    /// The legacy gas price: the chain has no base fee.
+    GasPrice,
+}
+
+/// A history that could not be read prices nothing. Swallowed, it read as a chain with no
+/// base fee, and every tier went out type-2 with a zero tip that may never be mined.
+pub fn pricing(read: &Result<FeeHistory, String>) -> Result<Pricing<'_>, String> {
+    let h = read.as_ref().map_err(Clone::clone)?;
+    if is_usable(h) {
+        return Ok(Pricing::Rewards(h));
+    }
+    match next_base_fee(h) {
+        0 => Ok(Pricing::GasPrice),
+        base => Ok(Pricing::NodeTip(base)),
+    }
 }
 
 /// A tier priced from a base fee and a tip that came from anywhere: the node's own
@@ -308,6 +332,23 @@ mod tests {
             gas_used_ratio: vec![0.5; 3],
         };
         assert!(!is_usable(&h), "empty reward rows must be a MISS");
+    }
+
+    #[test]
+    fn a_fee_history_that_cannot_be_read_is_an_error() {
+        // Measured on mainnet: the verified proxy refused a numeric blockCount, and every
+        // tier was priced off the gas price with a zero tip.
+        let why = "verified proxy: eth_feeHistory: quantity parameter must be a 0x-prefixed hex string";
+        assert_eq!(pricing(&Err(why.into())).unwrap_err(), why);
+    }
+
+    #[test]
+    fn blank_rewards_price_off_the_node_tip_and_no_base_fee_off_the_gas_price() {
+        let real = Ok(history(gwei(30.0), &[[gwei(1.0); 3]; 3]));
+        assert!(matches!(pricing(&real), Ok(Pricing::Rewards(_))));
+        let blank = Ok(history(gwei(30.0), &[[0; 3]; 3]));
+        assert!(matches!(pricing(&blank), Ok(Pricing::NodeTip(b)) if b == gwei(30.0)));
+        assert!(matches!(pricing(&Ok(FeeHistory::default())), Ok(Pricing::GasPrice)));
     }
 
     #[test]
