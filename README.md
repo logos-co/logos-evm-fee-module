@@ -62,6 +62,10 @@ Two rules sit on top of the medians:
   base fee at all falls back to `eth_gasPrice` with a **zero tip** — on a
   pre-1559 chain a priority fee is not meaningful, and emitting the gas price
   there is the original bug.
+- **A read that fails is an error, never a guess.** A fee history or a node tip
+  that cannot be read makes the answer `ok: false`. Swallowed, a failed history
+  looked like a chain with no base fee: measured on mainnet, every tier went out
+  as a type-2 transaction with a zero tip.
 
 ## API
 
