@@ -95,15 +95,17 @@ their own. `totalWei` equals `feeCeilingWei` and stays for older callers.
 `estimate` accepts, in order of precedence:
 
 ```jsonc
-{ "maxFeePerGas": "...", "maxPriorityFeePerGas": "..." }  // obeyed verbatim
+{ "maxFeePerGas": "...", "maxPriorityFeePerGas": "..." }  // obeyed verbatim, either or both
 { "tier": "slow" | "normal" | "fast" }                    // default: normal
 { "gasLimit": "..." }                                     // else estimated from "tx"
 { "tx": { ... } }                                         // eth_estimateGas
 { "deadlineMs": 5000 }                                    // bound this call
 ```
 
-This module advises; it does not overrule. An explicit fee override is used as
-given.
+This module advises; it does not overrule. An explicit fee field is used as
+given. With only one set, the other comes from the tier: a lone priority fee
+keeps the tier's headroom over the base fee beneath it, and a lone max fee caps
+the tier's tip. Either way the source is `custom`.
 
 ### Bundles
 

@@ -170,6 +170,25 @@ pub fn suggest_legacy(gas_price: u128, tier: &Tier) -> FeeSuggestion {
     FeeSuggestion { max_fee_per_gas: bumped, max_priority_fee_per_gas: 0u128 }
 }
 
+/// A tier with the caller's own fields in it. A field the caller set is used as given; with
+/// one set, the other comes from the tier: a lone tip keeps the tier's headroom over the base
+/// fee beneath it, and a lone max fee caps the tier's tip.
+pub fn with_overrides(tier: &FeeSuggestion, max: Option<u128>, tip: Option<u128>) -> Result<FeeSuggestion, String> {
+    let s = match (max, tip) {
+        (Some(m), Some(p)) => FeeSuggestion { max_fee_per_gas: m, max_priority_fee_per_gas: p },
+        (Some(m), None) => FeeSuggestion { max_fee_per_gas: m, max_priority_fee_per_gas: tier.max_priority_fee_per_gas.min(m) },
+        (None, Some(p)) => FeeSuggestion {
+            max_fee_per_gas: tier.max_fee_per_gas.saturating_sub(tier.max_priority_fee_per_gas).saturating_add(p),
+            max_priority_fee_per_gas: p,
+        },
+        (None, None) => tier.clone(),
+    };
+    if s.max_priority_fee_per_gas > s.max_fee_per_gas {
+        return Err("maxPriorityFeePerGas cannot exceed maxFeePerGas".into());
+    }
+    Ok(s)
+}
+
 /// What a sender will actually pay per gas, given a suggestion and the base
 /// fee that ends up in the block: `base + min(tip, maxFee - base)`.
 /// Exposed because it is the only honest way to compare two suggestions, and
@@ -363,5 +382,41 @@ mod tests {
         let s = suggest(&h, &TIERS[1], 1);
         assert_eq!(s.max_fee_per_gas, 0u128);
         assert_eq!(s.max_priority_fee_per_gas, 0u128);
+    }
+
+    // A field the caller set is theirs; a lone one used to price the whole fee at the tier.
+    #[test]
+    fn a_lone_tip_rides_on_the_tiers_headroom_over_the_base_fee() {
+        let tier = FeeSuggestion { max_fee_per_gas: gwei(3.0), max_priority_fee_per_gas: gwei(1.0) };
+        let s = with_overrides(&tier, None, Some(0)).unwrap();
+        assert_eq!(s, FeeSuggestion { max_fee_per_gas: gwei(2.0), max_priority_fee_per_gas: 0 });
+        let s = with_overrides(&tier, None, Some(gwei(4.0))).unwrap();
+        assert_eq!(s, FeeSuggestion { max_fee_per_gas: gwei(6.0), max_priority_fee_per_gas: gwei(4.0) });
+    }
+
+    #[test]
+    fn a_lone_max_fee_caps_the_tiers_tip() {
+        let tier = FeeSuggestion { max_fee_per_gas: gwei(3.0), max_priority_fee_per_gas: gwei(1.0) };
+        assert_eq!(with_overrides(&tier, Some(gwei(0.5)), None).unwrap(),
+                   FeeSuggestion { max_fee_per_gas: gwei(0.5), max_priority_fee_per_gas: gwei(0.5) });
+        assert_eq!(with_overrides(&tier, Some(gwei(5.0)), None).unwrap(),
+                   FeeSuggestion { max_fee_per_gas: gwei(5.0), max_priority_fee_per_gas: gwei(1.0) });
+    }
+
+    #[test]
+    fn both_fields_set_are_obeyed_and_none_set_is_the_tier() {
+        let tier = FeeSuggestion { max_fee_per_gas: gwei(3.0), max_priority_fee_per_gas: gwei(1.0) };
+        assert_eq!(with_overrides(&tier, Some(7), Some(5)).unwrap(),
+                   FeeSuggestion { max_fee_per_gas: 7, max_priority_fee_per_gas: 5 });
+        assert_eq!(with_overrides(&tier, None, None).unwrap(), tier);
+        assert!(with_overrides(&tier, Some(5), Some(7)).unwrap_err().contains("cannot exceed"));
+    }
+
+    // A chain with no base fee prices its tiers off gasPrice with no tip: a tip goes on top.
+    #[test]
+    fn a_lone_tip_on_a_legacy_tier_goes_on_top_of_its_price() {
+        let tier = suggest_legacy(gwei(2.0), &TIERS[1]);
+        let s = with_overrides(&tier, None, Some(gwei(1.0))).unwrap();
+        assert_eq!(s, FeeSuggestion { max_fee_per_gas: gwei(2.2) + gwei(1.0), max_priority_fee_per_gas: gwei(1.0) });
     }
 }

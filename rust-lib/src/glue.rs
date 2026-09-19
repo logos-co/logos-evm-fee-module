@@ -51,8 +51,8 @@ pub trait FeeModule: Send + Sync + 'static {
     /// Returns `{ ok, chainId, maxFeePerGas, maxPriorityFeePerGas, gasLimit,
     /// gasSource, feeCeilingWei(+Display/Exact), totalWei, baseFeePerGas,
     /// source }`. `totalWei` equals `feeCeilingWei` and stays for older callers.
-    /// An explicit fee override is used verbatim — this module advises, it does
-    /// not overrule the user.
+    /// An explicit fee field is used verbatim — this module advises, it does not
+    /// overrule the user. With one set, the other comes from the tier.
     fn estimate(&self, chain_id: i64, request_json: String) -> String;
 
     /// Price a bundle of calls that will leave in order, from one account.
@@ -189,8 +189,9 @@ impl FeeModuleImpl {
         }
     }
 
-    /// A caller that supplies BOTH fee fields is obeyed verbatim; we advise, we do not
-    /// overrule. Anything missing falls back to the named tier.
+    /// A fee field the caller set is used as given; we advise, we do not overrule. Both set,
+    /// the chain is not asked; one set, the other comes from the named tier
+    /// ([`estimator::with_overrides`]). Either set, the source is `custom`.
     fn fee_for(&self, chain_id: i64, req: &Value, b: &Budget) -> Result<Priced, String> {
         let over_max = req.get("maxFeePerGas").and_then(any_u128);
         let over_tip = req.get("maxPriorityFeePerGas").and_then(any_u128);
@@ -203,7 +204,9 @@ impl FeeModuleImpl {
         let wanted = req.get("tier").and_then(Value::as_str).unwrap_or("normal");
         let idx = TIERS.iter().position(|t| t.name == wanted).unwrap_or(1);
         let (sugg, base, source) = self.tiers(chain_id, b)?;
-        Ok(Priced { fee: sugg[idx].clone(), source, base })
+        let fee = estimator::with_overrides(&sugg[idx], over_max, over_tip)?;
+        let source = if over_max.is_some() || over_tip.is_some() { "custom" } else { source };
+        Ok(Priced { fee, source, base })
     }
 
     /// The slot a token keeps `allowance[owner][spender]` in, asked once per pair.
