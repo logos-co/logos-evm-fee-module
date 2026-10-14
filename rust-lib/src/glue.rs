@@ -126,7 +126,15 @@ struct Gas {
     source: &'static str,
 }
 
-type SlotCache = HashMap<(String, String), Option<String>>;
+#[derive(Clone)]
+enum Slot {
+    At(String),
+    Unlocated,
+    /// The route refused the probe's override, so no override will be taken.
+    NoOverrides,
+}
+
+type SlotCache = HashMap<(String, String), Slot>;
 
 impl FeeModuleImpl {
     fn grant(b: &Budget, what: &str) -> Result<Duration, String> {
@@ -210,19 +218,23 @@ impl FeeModuleImpl {
     }
 
     /// The slot a token keeps `allowance[owner][spender]` in, asked once per pair.
-    fn allowance_slot(&self, chain_id: i64, a: &Approval, owner: &str, cache: &mut SlotCache, b: &Budget) -> Option<String> {
+    fn allowance_slot(&self, chain_id: i64, a: &Approval, owner: &str, cache: &mut SlotCache, b: &Budget) -> Slot {
         let key = (a.token.clone(), a.spender.clone());
         if let Some(hit) = cache.get(&key) {
             return hit.clone();
         }
         let found = (|| {
-            let p = slots::probe(&a.token, owner, &a.spender)?;
-            let t = b.take()?;
+            let p = slots::probe(&a.token, owner, &a.spender).ok_or(Slot::Unlocated)?;
+            let t = b.take().ok_or(Slot::Unlocated)?;
             let params = json!([p.call, "latest", p.overrides]).to_string();
-            let reply = modules().eth_rpc_module.raw_rpc_with_timeout(chain_id, "eth_call", &params, t).ok()?;
-            let answer = inner(&reply).ok()?;
-            slots::identify(&p, answer.as_str()?)
-        })();
+            let reply = modules().eth_rpc_module.raw_rpc_with_timeout(chain_id, "eth_call", &params, t).map_err(|_| Slot::Unlocated)?;
+            if bundle::refused_with(&reply, bundle::OVERRIDES_UNSUPPORTED) {
+                return Err(Slot::NoOverrides);
+            }
+            let answer = inner(&reply).map_err(|_| Slot::Unlocated)?;
+            answer.as_str().and_then(|a| slots::identify(&p, a)).map(Slot::At).ok_or(Slot::Unlocated)
+        })()
+        .unwrap_or_else(|s| s);
         cache.insert(key, found.clone());
         found
     }
@@ -245,9 +257,20 @@ impl FeeModuleImpl {
         let name = bundle::call_name(i, call);
         let mut diffs: Map<String, Value> = Map::new();
         let mut unlocated: Vec<String> = Vec::new();
-        for (j, a) in bundle::approvals_before(calls, i) {
+        let approvals = bundle::approvals_before(calls, i);
+        let fallback = |assumptions: &mut Vec<Value>| -> Result<Gas, String> {
+            let (j, a) = &approvals[0];
+            let limit = bundle::fallback_for(call, &name, j + 1)?;
+            assumptions.push(json!({
+                "call": i + 1, "after": j + 1, "token": a.token, "spender": a.spender,
+                "gasLimitFallback": limit, "reason": "this route cannot take a state override",
+            }));
+            Ok(Gas { limit, source: "fallback" })
+        };
+        for (j, a) in approvals.iter().cloned() {
             match self.allowance_slot(chain_id, &a, from, cache, b) {
-                Some(slot) => {
+                Slot::NoOverrides => return fallback(assumptions),
+                Slot::At(slot) => {
                     let entry = diffs.entry(a.token.clone()).or_insert_with(|| json!({ "stateDiff": {} }));
                     entry["stateDiff"][slot] = json!(a.amount_word);
                     assumptions.push(json!({
@@ -255,7 +278,7 @@ impl FeeModuleImpl {
                         "token": a.token, "spender": a.spender, "allowance": a.amount(),
                     }));
                 }
-                None => unlocated.push(format!("the allowance {} keeps for {} could not be located, so call {} was not modelled", a.token, a.spender, j + 1)),
+                Slot::Unlocated => unlocated.push(format!("the allowance {} keeps for {} could not be located, so call {} was not modelled", a.token, a.spender, j + 1)),
             }
         }
         let tx = for_estimate(&call.tx(from));
@@ -267,6 +290,9 @@ impl FeeModuleImpl {
             modules().eth_rpc_module.raw_rpc_with_timeout(chain_id, "eth_estimateGas", &params, t)
         }
         .map_err(|e| format!("{name} could not be estimated: {e:?}"))?;
+        if !diffs.is_empty() && bundle::refused_with(&reply, bundle::OVERRIDES_UNSUPPORTED) {
+            return fallback(assumptions);
+        }
         let gas = inner(&reply).map_err(|why| {
             let mut msg = format!("{name} could not be estimated: {why}");
             for u in &unlocated {

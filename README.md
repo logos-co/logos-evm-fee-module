@@ -83,8 +83,9 @@ estimate_bundle(chain_id, request_json)  -> { ok, chainId, maxFeePerGas, maxPrio
 `"custom"`. All **wei** values are decimal strings — JSON numbers cannot carry
 256 bits. `gasLimit` is a JSON **number**: it is a bounded count, not a wei value.
 `gasSource` is `"given"` (the caller's own limit), `"estimated"` (`eth_estimateGas`
-against the chain as it is) or `"simulated"` (estimated under an earlier call's
-approve, see below).
+against the chain as it is), `"simulated"` (estimated under an earlier call's
+approve, see below) or `"fallback"` (the caller's `gasLimitFallback`, used because
+the route cannot take a state override).
 
 Every ceiling is `maxFeePerGas × gasLimit`, and every `feeCeilingWei` comes with
 `feeCeilingWeiDisplay` (at most five places, truncated, `"<0.00001"` for dust)
@@ -139,9 +140,12 @@ bundle: `{ ok: false, error, call }`, the error naming the call and, if a
 token's allowance slot could not be located, saying so. A call that depends on
 an earlier effect that is not an ERC-20 approve must carry its own `gasLimit`.
 
-Through the verified proxy no state override can be expressed, so a call behind
-an approval refuses there exactly as it did before; `eth_simulateV1` would model
-any sequence on nodes that serve it and is the next step if that ever matters.
+Through the verified proxy no state override can be expressed
+([nimbus-eth1#4986](https://github.com/status-im/nimbus-eth1/issues/4986)), and
+`eth_rpc` refuses one there with `code: "overrides_unsupported"`. A call behind an
+approval then takes its own `gasLimitFallback` (`gasSource: "fallback"`, and an
+assumption `{ call, after, token, spender, gasLimitFallback, reason }`), or
+refuses without one. Wherever overrides work the fallback is never read.
 
 ## Design notes
 
