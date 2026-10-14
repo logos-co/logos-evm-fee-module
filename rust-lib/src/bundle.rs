@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 use crate::slots::{parse_approve, Approval};
 
 pub const MAX_CALLS: usize = 16;
+/// eth_rpc's refusal of a state override it cannot route (the verified proxy).
+pub const OVERRIDES_UNSUPPORTED: &str = "overrides_unsupported";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Call {
@@ -15,6 +17,8 @@ pub struct Call {
     pub data: String,
     /// A limit the caller vouches for; the estimator does not second-guess one.
     pub gas_limit: Option<u64>,
+    /// Used only when an earlier approve cannot be modelled because overrides are unavailable.
+    pub gas_limit_fallback: Option<u64>,
     pub label: String,
 }
 
@@ -62,21 +66,25 @@ fn normalize_data(v: Option<&Value>, name: &str) -> Result<String, String> {
     Ok(format!("0x{}", body.to_ascii_lowercase()))
 }
 
-/// `{ to, value?, data?, gasLimit?, label? }`. `name` is how a refusal refers to it.
+fn gas_field(v: &Value, key: &str, name: &str) -> Result<Option<u64>, String> {
+    quantity_field(v, key, name)?
+        .map(|g| u64::try_from(g).ok().filter(|g| *g > 0).ok_or_else(|| format!("{name}: `{key}` is not a positive gas count")))
+        .transpose()
+}
+
+/// `{ to, value?, data?, gasLimit?, gasLimitFallback?, label? }`. `name` is how a refusal refers to it.
 pub fn parse_call(v: &Value, name: &str) -> Result<Call, String> {
     let to = v.get("to").and_then(Value::as_str).map(str::trim).unwrap_or("");
     let to_hex = to.strip_prefix("0x").or_else(|| to.strip_prefix("0X")).unwrap_or("");
     if to_hex.len() != 40 || !to_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("{name}: `to` is not an address"));
     }
-    let gas_limit = quantity_field(v, "gasLimit", name)?
-        .map(|g| u64::try_from(g).ok().filter(|g| *g > 0).ok_or_else(|| format!("{name}: `gasLimit` is not a positive gas count")))
-        .transpose()?;
     Ok(Call {
         to: to.to_string(),
         value: quantity_field(v, "value", name)?.unwrap_or(0),
         data: normalize_data(v.get("data"), name)?,
-        gas_limit,
+        gas_limit: gas_field(v, "gasLimit", name)?,
+        gas_limit_fallback: gas_field(v, "gasLimitFallback", name)?,
         label: v.get("label").and_then(Value::as_str).unwrap_or("").trim().to_string(),
     })
 }
@@ -92,6 +100,20 @@ pub fn name_of(i: usize, v: &Value) -> String {
 /// The same naming for a parsed call.
 pub fn call_name(i: usize, c: &Call) -> String {
     if c.label.is_empty() { format!("call {}", i + 1) } else { format!("call {} ({})", i + 1, c.label) }
+}
+
+/// Whether `reply` is an eth_rpc refusal carrying `code`.
+pub fn refused_with(reply: &str, code: &str) -> bool {
+    serde_json::from_str::<Value>(reply)
+        .is_ok_and(|v| v.get("ok") == Some(&json!(false)) && v.get("code").and_then(Value::as_str) == Some(code))
+}
+
+/// The limit for a call behind call `after`'s approve when no override can model it.
+pub fn fallback_for(call: &Call, name: &str, after: usize) -> Result<u64, String> {
+    call.gas_limit_fallback.ok_or_else(|| {
+        format!("{name} could not be estimated: it needs call {after}'s approve applied, and this chain's \
+                 verified route cannot take a state override; give it a gasLimit")
+    })
 }
 
 /// The `calls` array of a bundle request, in order.
@@ -128,11 +150,11 @@ mod tests {
 
     fn approve(amount: u64) -> Call {
         let data = format!("0x095ea7b3000000000000000000000000{}{:064x}", &ROUTER[2..].to_ascii_lowercase(), amount);
-        Call { to: TOKEN.into(), value: 0, data, gas_limit: None, label: "Approve".into() }
+        Call { to: TOKEN.into(), value: 0, data, gas_limit: None, gas_limit_fallback: None, label: "Approve".into() }
     }
 
     fn swap() -> Call {
-        Call { to: ROUTER.into(), value: 0, data: "0x5ae401dc".into(), gas_limit: None, label: "Swap".into() }
+        Call { to: ROUTER.into(), value: 0, data: "0x5ae401dc".into(), gas_limit: None, gas_limit_fallback: None, label: "Swap".into() }
     }
 
     #[test]
@@ -182,6 +204,26 @@ mod tests {
         assert_eq!(bad(json!({ "to": TOKEN, "value": "lots" })), "call 1: `value` is not a quantity");
         assert!(parse_calls(&json!({ "calls": [] })).is_err());
         assert!(parse_calls(&json!({})).is_err());
+    }
+
+    #[test]
+    fn a_fallback_is_parsed_and_used_only_when_offered() {
+        let calls = parse_calls(&json!({ "calls": [{ "to": ROUTER, "gasLimitFallback": "0x493e0", "label": "Swap" }] })).unwrap();
+        assert_eq!((calls[0].gas_limit, calls[0].gas_limit_fallback), (None, Some(300_000)));
+        assert_eq!(fallback_for(&calls[0], "call 2 (Swap)", 1), Ok(300_000));
+        let e = fallback_for(&swap(), "call 2 (Swap)", 1).unwrap_err();
+        assert!(e.starts_with("call 2 (Swap) could not be estimated: it needs call 1's approve"), "{e}");
+        let bad = parse_calls(&json!({ "calls": [{ "to": ROUTER, "gasLimitFallback": 0 }] })).unwrap_err();
+        assert_eq!(bad, "call 1: `gasLimitFallback` is not a positive gas count");
+    }
+
+    #[test]
+    fn only_an_ok_false_reply_with_the_code_is_a_refusal() {
+        let no = r#"{"ok":false,"code":"overrides_unsupported","error":"eth_call with a state override …"}"#;
+        assert!(refused_with(no, OVERRIDES_UNSUPPORTED));
+        assert!(!refused_with(r#"{"ok":false,"code":"timeout","error":"t"}"#, OVERRIDES_UNSUPPORTED));
+        assert!(!refused_with(r#"{"ok":true,"result":"0x5208"}"#, OVERRIDES_UNSUPPORTED));
+        assert!(!refused_with("not json", OVERRIDES_UNSUPPORTED));
     }
 
     #[test]
