@@ -32,7 +32,11 @@ mod bundle;
 pub use bundle::{approvals_before, call_name, name_of, parse_call, parse_calls, parse_quantity, Call, MAX_CALLS};
 
 mod budget;
-pub use budget::{bound, slice, Budget, DEFAULT_BUDGET, MIN_SLICE, RPC_CAP};
+pub use budget::{bound, default_total, round_trip, slice, Budget, CONFIG_READ, DEFAULT_BUDGET, MARGIN, MIN_SLICE,
+                 RPC_CAP};
+
+mod failure;
+pub use failure::{endpoint, no_time, refusal, secs, transport, Failure};
 
 #[cfg(feature = "logos_module")]
 mod glue;

@@ -13,13 +13,15 @@
 //! `eth_rpc_module` reports.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use logos_rust_sdk::LogosError;
 use serde_json::{json, Map, Value};
 
-use crate::budget::Budget;
+use crate::budget::{self, Budget, CONFIG_READ};
 use crate::bundle::{self, Call};
 use crate::estimator::{self, FeeHistory, FeeSuggestion, Pricing, TIERS};
+use crate::failure::{self, Failure};
 use crate::slots::{self, Approval};
 use crate::tx::for_estimate;
 use crate::units;
@@ -87,6 +89,65 @@ fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
 }
 
+/// A refusal with its machine code beside the sentence, when it has one.
+fn refused(f: Failure) -> Value {
+    let mut v = json!({ "ok": false, "error": f.why });
+    if !f.code.is_empty() {
+        v["code"] = json!(f.code);
+    }
+    v
+}
+
+/// One request's chain as eth_rpc has it configured, and the allowance every round trip on it
+/// shares. A refusal names the endpoint and the timeout the user set for it.
+struct Chain {
+    id: i64,
+    endpoint: String,
+    budget: Budget,
+}
+
+impl Chain {
+    /// The round trip and the name come from eth_rpc's config, a local read charged to the same
+    /// allowance. An unreadable one leaves eth_rpc's defaults.
+    fn open(id: i64, rounds: u32, deadline_ms: Option<i64>) -> Self {
+        let started = Instant::now();
+        let config = modules()
+            .eth_rpc_module
+            .get_chain_config_with_timeout(id, CONFIG_READ)
+            .ok()
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .and_then(|v| v.get("config").cloned())
+            .unwrap_or(Value::Null);
+        let name = config.get("name").and_then(Value::as_str).map(str::to_string)
+            .unwrap_or_else(|| format!("chain {id}"));
+        let verified = config.get("verifiedProxyMode").and_then(Value::as_str) == Some("required");
+        let budget = Budget::for_chain(started, budget::round_trip(&config), rounds, deadline_ms);
+        Chain { id, endpoint: failure::endpoint(&name, verified), budget }
+    }
+
+    /// One round trip, started only on a whole one: eth_rpc's reply, or why there was none.
+    fn ask(&self, what: &str, call: impl FnOnce(Duration) -> Result<String, LogosError>) -> Result<String, Failure> {
+        let rt = self.budget.round_trip();
+        let t = self.budget.take().map_err(|left| self.failed(what, failure::no_time(left, &self.endpoint, rt)))?;
+        call(t).map_err(|e| self.failed(what, match &e {
+            LogosError::PluginCallFailed { message, .. } => failure::transport(message, &self.endpoint, rt),
+            other => Failure { code: "transport".into(), why: format!("eth_rpc_module could not be asked ({other})") },
+        }))
+    }
+
+    /// The reply's result, or eth_rpc's refusal in words.
+    fn answer(&self, what: &str, reply: &str) -> Result<Value, Failure> {
+        match failure::refusal(reply, &self.endpoint, self.budget.round_trip()) {
+            Some(f) => Err(self.failed(what, f)),
+            None => inner(reply).map_err(Failure::from),
+        }
+    }
+
+    fn failed(&self, what: &str, f: Failure) -> Failure {
+        Failure { code: f.code, why: format!("Couldn't {what}: {}.", f.why) }
+    }
+}
+
 /// eth_rpc wraps every reply as `{ ok, result }`. Unwrap to the inner result.
 fn inner(reply: &str) -> Result<Value, String> {
     let v: Value = serde_json::from_str(reply).map_err(|e| e.to_string())?;
@@ -137,19 +198,14 @@ enum Slot {
 type SlotCache = HashMap<(String, String), Slot>;
 
 impl FeeModuleImpl {
-    fn grant(b: &Budget, what: &str) -> Result<Duration, String> {
-        b.take().ok_or_else(|| format!("no time left to {what}"))
-    }
-
     /// Pull fee history for every tier percentile in ONE call.
-    fn history(&self, chain_id: i64, b: &Budget) -> Result<FeeHistory, String> {
-        let t = Self::grant(b, "read the fee history")?;
-        let percentiles: Vec<f64> = TIERS.iter().map(|t| t.reward_percentile).collect();
-        let reply = modules()
-            .eth_rpc_module
-            .fee_history_with_timeout(chain_id, HISTORY_BLOCKS, &json!(percentiles).to_string(), t)
-            .map_err(|e| format!("{e:?}"))?;
-        let r = inner(&reply)?;
+    fn history(&self, c: &Chain) -> Result<FeeHistory, Failure> {
+        let what = "read the fee history";
+        let percentiles = json!(TIERS.iter().map(|t| t.reward_percentile).collect::<Vec<f64>>()).to_string();
+        let reply = c.ask(what, |t| {
+            modules().eth_rpc_module.fee_history_with_timeout(c.id, HISTORY_BLOCKS, &percentiles, t)
+        })?;
+        let r = c.answer(what, &reply)?;
         Ok(FeeHistory {
             base_fee_per_gas: r["baseFeePerGas"].as_array().map(|a| a.iter().map(hex_u128).collect()).unwrap_or_default(),
             reward: r["reward"]
@@ -160,26 +216,25 @@ impl FeeModuleImpl {
         })
     }
 
-    fn gas_price(&self, chain_id: i64, b: &Budget) -> Result<u128, String> {
-        let t = Self::grant(b, "read the gas price")?;
-        let reply = modules().eth_rpc_module.gas_price_with_timeout(chain_id, t).map_err(|e| format!("{e:?}"))?;
-        Ok(hex_u128(&inner(&reply)?))
+    fn gas_price(&self, c: &Chain) -> Result<u128, Failure> {
+        let what = "read the gas price";
+        let reply = c.ask(what, |t| modules().eth_rpc_module.gas_price_with_timeout(c.id, t))?;
+        Ok(hex_u128(&c.answer(what, &reply)?))
     }
 
     /// The node's own tip suggestion.
-    fn node_tip(&self, chain_id: i64, b: &Budget) -> Result<u128, String> {
-        let t = Self::grant(b, "read the node's tip")?;
-        let reply = modules()
-            .eth_rpc_module
-            .raw_rpc_with_timeout(chain_id, "eth_maxPriorityFeePerGas", "[]", t)
-            .map_err(|e| format!("{e:?}"))?;
-        Ok(hex_u128(&inner(&reply)?))
+    fn node_tip(&self, c: &Chain) -> Result<u128, Failure> {
+        let what = "read the node's tip";
+        let reply = c.ask(what, |t| {
+            modules().eth_rpc_module.raw_rpc_with_timeout(c.id, "eth_maxPriorityFeePerGas", "[]", t)
+        })?;
+        Ok(hex_u128(&c.answer(what, &reply)?))
     }
 
     /// Suggestions per tier, priced as [`estimator::pricing`] decides. A history or a tip
     /// that cannot be read is the answer's error, never a zero tip.
-    fn tiers(&self, chain_id: i64, b: &Budget) -> Result<(Vec<FeeSuggestion>, u128, &'static str), String> {
-        let read = self.history(chain_id, b);
+    fn tiers(&self, c: &Chain) -> Result<(Vec<FeeSuggestion>, u128, &'static str), Failure> {
+        let read: Result<FeeHistory, String> = Ok(self.history(c)?);
         match estimator::pricing(&read)? {
             Pricing::Rewards(h) => {
                 let mut v: Vec<FeeSuggestion> = TIERS.iter().enumerate().map(|(i, t)| estimator::suggest(h, t, i)).collect();
@@ -187,11 +242,11 @@ impl FeeModuleImpl {
                 Ok((v, estimator::next_base_fee(h), "feeHistory"))
             }
             Pricing::NodeTip(base) => {
-                let tip = self.node_tip(chain_id, b)?;
+                let tip = self.node_tip(c)?;
                 Ok((TIERS.iter().map(|t| estimator::suggest_with_tip(base, tip, t)).collect(), base, "maxPriorityFee"))
             }
             Pricing::GasPrice => {
-                let gp = self.gas_price(chain_id, b)?;
+                let gp = self.gas_price(c)?;
                 Ok((TIERS.iter().map(|t| estimator::suggest_legacy(gp, t)).collect(), 0u128, "gasPrice"))
             }
         }
@@ -200,7 +255,7 @@ impl FeeModuleImpl {
     /// A fee field the caller set is used as given; we advise, we do not overrule. Both set,
     /// the chain is not asked; one set, the other comes from the named tier
     /// ([`estimator::with_overrides`]). Either set, the source is `custom`.
-    fn fee_for(&self, chain_id: i64, req: &Value, b: &Budget) -> Result<Priced, String> {
+    fn fee_for(&self, c: &Chain, req: &Value) -> Result<Priced, Failure> {
         let over_max = req.get("maxFeePerGas").and_then(any_u128);
         let over_tip = req.get("maxPriorityFeePerGas").and_then(any_u128);
         if let (Some(m), Some(p)) = (over_max, over_tip) {
@@ -211,23 +266,23 @@ impl FeeModuleImpl {
         }
         let wanted = req.get("tier").and_then(Value::as_str).unwrap_or("normal");
         let idx = TIERS.iter().position(|t| t.name == wanted).unwrap_or(1);
-        let (sugg, base, source) = self.tiers(chain_id, b)?;
+        let (sugg, base, source) = self.tiers(c)?;
         let fee = estimator::with_overrides(&sugg[idx], over_max, over_tip)?;
         let source = if over_max.is_some() || over_tip.is_some() { "custom" } else { source };
         Ok(Priced { fee, source, base })
     }
 
     /// The slot a token keeps `allowance[owner][spender]` in, asked once per pair.
-    fn allowance_slot(&self, chain_id: i64, a: &Approval, owner: &str, cache: &mut SlotCache, b: &Budget) -> Slot {
+    fn allowance_slot(&self, c: &Chain, a: &Approval, owner: &str, cache: &mut SlotCache) -> Slot {
         let key = (a.token.clone(), a.spender.clone());
         if let Some(hit) = cache.get(&key) {
             return hit.clone();
         }
         let found = (|| {
             let p = slots::probe(&a.token, owner, &a.spender).ok_or(Slot::Unlocated)?;
-            let t = b.take().ok_or(Slot::Unlocated)?;
+            let t = c.budget.take().map_err(|_| Slot::Unlocated)?;
             let params = json!([p.call, "latest", p.overrides]).to_string();
-            let reply = modules().eth_rpc_module.raw_rpc_with_timeout(chain_id, "eth_call", &params, t).map_err(|_| Slot::Unlocated)?;
+            let reply = modules().eth_rpc_module.raw_rpc_with_timeout(c.id, "eth_call", &params, t).map_err(|_| Slot::Unlocated)?;
             if bundle::refused_with(&reply, bundle::OVERRIDES_UNSUPPORTED) {
                 return Err(Slot::NoOverrides);
             }
@@ -242,14 +297,13 @@ impl FeeModuleImpl {
     /// `eth_estimateGas` for call `i`, under the allowances the calls before it set.
     fn estimate_call(
         &self,
-        chain_id: i64,
+        c: &Chain,
         from: &str,
         calls: &[Call],
         i: usize,
         cache: &mut SlotCache,
         assumptions: &mut Vec<Value>,
-        b: &Budget,
-    ) -> Result<Gas, String> {
+    ) -> Result<Gas, Failure> {
         let call = &calls[i];
         if let Some(g) = call.gas_limit {
             return Ok(Gas { limit: g, source: "given" });
@@ -258,7 +312,7 @@ impl FeeModuleImpl {
         let mut diffs: Map<String, Value> = Map::new();
         let mut unlocated: Vec<String> = Vec::new();
         let approvals = bundle::approvals_before(calls, i);
-        let fallback = |assumptions: &mut Vec<Value>| -> Result<Gas, String> {
+        let fallback = |assumptions: &mut Vec<Value>| -> Result<Gas, Failure> {
             let (j, a) = &approvals[0];
             let limit = bundle::fallback_for(call, &name, j + 1)?;
             assumptions.push(json!({
@@ -268,7 +322,7 @@ impl FeeModuleImpl {
             Ok(Gas { limit, source: "fallback" })
         };
         for (j, a) in approvals.iter().cloned() {
-            match self.allowance_slot(chain_id, &a, from, cache, b) {
+            match self.allowance_slot(c, &a, from, cache) {
                 Slot::NoOverrides => return fallback(assumptions),
                 Slot::At(slot) => {
                     let entry = diffs.entry(a.token.clone()).or_insert_with(|| json!({ "stateDiff": {} }));
@@ -282,17 +336,24 @@ impl FeeModuleImpl {
             }
         }
         let tx = for_estimate(&call.tx(from));
-        let t = Self::grant(b, &format!("estimate {name}"))?;
-        let reply = if diffs.is_empty() {
-            modules().eth_rpc_module.estimate_gas_with_timeout(chain_id, &tx.to_string(), t)
-        } else {
-            let params = json!([tx, "latest", Value::Object(diffs.clone())]).to_string();
-            modules().eth_rpc_module.raw_rpc_with_timeout(chain_id, "eth_estimateGas", &params, t)
-        }
-        .map_err(|e| format!("{name} could not be estimated: {e:?}"))?;
+        let what = format!("estimate {name}");
+        let reply = c.ask(&what, |t| {
+            if diffs.is_empty() {
+                modules().eth_rpc_module.estimate_gas_with_timeout(c.id, &tx.to_string(), t)
+            } else {
+                let params = json!([tx, "latest", Value::Object(diffs.clone())]).to_string();
+                modules().eth_rpc_module.raw_rpc_with_timeout(c.id, "eth_estimateGas", &params, t)
+            }
+        })?;
         if !diffs.is_empty() && bundle::refused_with(&reply, bundle::OVERRIDES_UNSUPPORTED) {
             return fallback(assumptions);
         }
+        // A timeout is the endpoint's, not the call's: no gasLimit advice under it.
+        let refusal = failure::refusal(&reply, &c.endpoint, c.budget.round_trip());
+        if let Some(f) = refusal.clone().filter(|f| f.code == "timeout") {
+            return Err(c.failed(&what, f));
+        }
+        let code = refusal.map(|f| f.code).unwrap_or_default();
         let gas = inner(&reply).map_err(|why| {
             let mut msg = format!("{name} could not be estimated: {why}");
             for u in &unlocated {
@@ -300,7 +361,7 @@ impl FeeModuleImpl {
                 msg.push_str(u);
             }
             msg.push_str("; give it a gasLimit if it depends on an earlier call's effect that is not an ERC-20 approve");
-            msg
+            Failure { code, why: msg }
         })?;
         Ok(Gas {
             limit: u64::try_from(hex_u128(&gas)).unwrap_or(u64::MAX),
@@ -341,10 +402,10 @@ impl FeeModuleImpl {
 
 impl FeeModule for FeeModuleImpl {
     fn suggest_fees(&self, chain_id: i64) -> String {
-        let b = Budget::bounded_by(None);
-        let (sugg, base, source) = match self.tiers(chain_id, &b) {
+        let c = Chain::open(chain_id, 2, None);
+        let (sugg, base, source) = match self.tiers(&c) {
             Ok(v) => v,
-            Err(e) => return err(e),
+            Err(e) => return refused(e).to_string(),
         };
         let mut tiers = serde_json::Map::new();
         for (t, s) in TIERS.iter().zip(sugg.iter()) {
@@ -363,10 +424,10 @@ impl FeeModule for FeeModuleImpl {
 
     fn estimate(&self, chain_id: i64, request_json: String) -> String {
         let req: Value = serde_json::from_str(&request_json).unwrap_or_else(|_| json!({}));
-        let b = Budget::bounded_by(req.get("deadlineMs").and_then(Value::as_i64));
-        let priced = match self.fee_for(chain_id, &req, &b) {
+        let c = Chain::open(chain_id, 3, req.get("deadlineMs").and_then(Value::as_i64));
+        let priced = match self.fee_for(&c, &req) {
             Ok(p) => p,
-            Err(e) => return err(e),
+            Err(e) => return refused(e).to_string(),
         };
 
         // Gas limit: an explicit override, else estimate_gas on the supplied tx. The tx is
@@ -374,16 +435,13 @@ impl FeeModule for FeeModuleImpl {
         let gas = if let Some(g) = req.get("gasLimit").and_then(any_u128) {
             Gas { limit: u64::try_from(g).unwrap_or(u64::MAX), source: "given" }
         } else if let Some(tx) = req.get("tx") {
-            let t = match Self::grant(&b, "estimate the call") {
-                Ok(t) => t,
-                Err(e) => return err(e),
-            };
-            match modules().eth_rpc_module.estimate_gas_with_timeout(chain_id, &for_estimate(tx).to_string(), t) {
-                Ok(reply) => match inner(&reply) {
-                    Ok(v) => Gas { limit: u64::try_from(hex_u128(&v)).unwrap_or(u64::MAX), source: "estimated" },
-                    Err(e) => return err(e),
-                },
-                Err(e) => return err(format!("{e:?}")),
+            let what = "estimate the call";
+            let tx = for_estimate(tx).to_string();
+            match c.ask(what, |t| modules().eth_rpc_module.estimate_gas_with_timeout(chain_id, &tx, t))
+                .and_then(|reply| c.answer(what, &reply))
+            {
+                Ok(v) => Gas { limit: u64::try_from(hex_u128(&v)).unwrap_or(u64::MAX), source: "estimated" },
+                Err(e) => return refused(e).to_string(),
             }
         } else {
             Gas { limit: 0, source: "none" }
@@ -410,7 +468,6 @@ impl FeeModule for FeeModuleImpl {
             Ok(v) => v,
             Err(e) => return err(format!("request is not JSON: {e}")),
         };
-        let b = Budget::bounded_by(req.get("deadlineMs").and_then(Value::as_i64));
         let from = req.get("from").and_then(Value::as_str).map(str::trim).unwrap_or("");
         if !is_address(from) {
             return err("`from` is not an address");
@@ -419,17 +476,24 @@ impl FeeModule for FeeModuleImpl {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        let priced = match self.fee_for(chain_id, &req, &b) {
+        // The history, a tip, an estimate per call and an allowance probe per call after the first.
+        let rounds = 1 + 2 * calls.len() as u32;
+        let c = Chain::open(chain_id, rounds, req.get("deadlineMs").and_then(Value::as_i64));
+        let priced = match self.fee_for(&c, &req) {
             Ok(p) => p,
-            Err(e) => return err(e),
+            Err(e) => return refused(e).to_string(),
         };
         let mut cache = SlotCache::new();
         let mut assumptions = Vec::new();
         let mut gas = Vec::with_capacity(calls.len());
         for i in 0..calls.len() {
-            match self.estimate_call(chain_id, from, &calls, i, &mut cache, &mut assumptions, &b) {
+            match self.estimate_call(&c, from, &calls, i, &mut cache, &mut assumptions) {
                 Ok(g) => gas.push(g),
-                Err(e) => return json!({ "ok": false, "error": e, "call": i + 1 }).to_string(),
+                Err(e) => {
+                    let mut v = refused(e);
+                    v["call"] = json!(i + 1);
+                    return v.to_string();
+                }
             }
         }
         Self::bundle_reply(chain_id, &priced, &gas, assumptions).to_string()
