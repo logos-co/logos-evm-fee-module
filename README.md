@@ -136,7 +136,7 @@ What the estimate took for granted is reported, per call, in `assumptions`:
 `{ call, after, token, spender, allowance }` — "call 2 was estimated as if call 1
 had set this allowance". A call with its own `gasLimit` is taken as given and
 never estimated. The first call that cannot be estimated refuses the whole
-bundle: `{ ok: false, error, call }`, the error naming the call and, if a
+bundle: `{ ok: false, error, code?, call }`, the error naming the call and, if a
 token's allowance slot could not be located, saying so. A call that depends on
 an earlier effect that is not an ERC-20 approve must carry its own `gasLimit`.
 
@@ -157,8 +157,13 @@ refuses without one. Wherever overrides work the fallback is never read.
   the single fail-closed proxy chokepoint. State overrides travel through its
   `raw_rpc`, as the three-parameter forms of `eth_call` and `eth_estimateGas`.
 - **Bounded as a whole.** A bundle of N calls is up to N estimates plus a probe
-  per token; the request's `deadlineMs` bounds their sum (20 s when absent, and
-  a caller may only shorten it), and each round trip gets at most 8 s.
+  per token; the request's `deadlineMs` bounds their sum (when absent, enough for
+  every round trip and never under 20 s; a caller may only shorten it). Each round
+  trip gets the chain's own timeout from `eth_rpc` (`timeoutSecs`, or
+  `verifiedTimeoutSecs` through the verified proxy), and one with less than that
+  left is not started: the refusal says so with `code: "not_enough_time"`.
+- **Refusals are sentences.** "Couldn't read the fee history: Ethereum's RPC
+  endpoint didn't answer within 8 s.", with the cause's `code` beside it.
 - **The `tx` sent to `eth_estimateGas` carries a zero fee cap.** Given a `tx`
   with no `gas`, the nimbus verified proxy prices the whole block gas limit
   against the sender's balance and refuses anything under ~0.27 ETH. A zero cap
